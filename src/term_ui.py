@@ -1,16 +1,18 @@
 """
-term_ui.py — Терминальный UI на Rich.
+term_ui.py — Fullscreen chat-style TUI (OpenCode-стиль).
 
-Компоновка экрана:
-  ┌─────────────────────────────────────────┐
-  │        XENITH · Статус агентов           │
-  ├──────────┬──────────────────────────────┤
-  │  Агенты  │       Лог событий            │
-  ├──────────┴──────────────────────────────┤
-  │        Последний результат               │
-  ├─────────────────────────────────────────┤
-  │  > Ввод команды (в нижней части)        │
-  └─────────────────────────────────────────┘
+Компоновка:
+  ┌─ XENITH ── agent-1 ● idle ── agent-2 ⟳ working ─────────────────────────┐
+  │                                                                          │
+  │  you                                                                     │
+  │  ┃ напиши функцию сортировки                                             │
+  │                                                                          │
+  │  agent-1 · qwen2.5-coder                                                 │
+  │  ┃ def quicksort(arr): ...                                               │
+  │                                                                          │
+  ├──────────────────────────────────────────────────────────────────────────┤
+  │ ❯ _                                                                      │
+  └──────────────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
@@ -18,185 +20,204 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from collections import deque
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from rich import box
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.table import Table
+from rich.rule import Rule
+from rich.syntax import Syntax
 from rich.text import Text
+from rich import box
 
 if TYPE_CHECKING:
     from core import AgentManager
     from orchestrator import TaskResult
 
 
-BANNER = "[bold cyan]X E N I T H[/]  [dim]AI Agent Orchestrator[/]"
+# ── Типы сообщений ────────────────────────────────────────────────────────────
 
-STATUS_COLOR = {
-    "idle":    "green",
-    "working": "yellow",
-    "error":   "red",
-    "stopped": "dim",
+@dataclass
+class ChatMessage:
+    role: str           # "you" | "agent-1" | "system"
+    content: str
+    model: str = ""
+    ts: str = field(default_factory=lambda: time.strftime("%H:%M:%S"))
+
+
+# ── Цвета и стили ─────────────────────────────────────────────────────────────
+
+ROLE_STYLE = {
+    "you":    ("bright_white", "bold"),
+    "system": ("dim",          ""),
 }
 
+AGENT_COLORS = ["cyan", "green", "yellow", "magenta", "blue"]
+
 STATUS_ICON = {
-    "idle":    "●",
-    "working": "⟳",
-    "error":   "✗",
-    "stopped": "○",
+    "idle":    ("●", "green"),
+    "working": ("⟳", "yellow"),
+    "error":   ("✗", "red"),
+    "stopped": ("○", "dim"),
 }
 
 
 class XenithUI:
-    """
-    Терминальный интерфейс XENITH.
-
-    Rich.Live обновляет панели без мигания.
-    Ввод команд работает в отдельном потоке через sys.stdin.
-    """
-
-    MAX_LOG = 200
-    MAX_RESULT_LINES = 30
+    """Fullscreen chat TUI. Вся история — в _messages, Live её рендерит."""
 
     def __init__(self, manager: "AgentManager") -> None:
         self.manager = manager
         self.console = Console()
-        self._log: deque[str] = deque(maxlen=self.MAX_LOG)
-        self._last_result: str = ""
-        self._last_result_id: str = ""
+        self._messages: list[ChatMessage] = []
+        self._input_line: str = ""
         self._running = False
         self._lock = threading.Lock()
+        self._agent_colors: dict[str, str] = {}
 
-        manager.on_log(self._push_log)
-        manager.on_result(self._push_result)
+        # назначаем каждому агенту свой цвет
+        for i, ag in enumerate(manager.agents):
+            self._agent_colors[ag.id] = AGENT_COLORS[i % len(AGENT_COLORS)]
+
+        manager.on_log(self._on_log)
+        manager.on_result(self._on_result)
+
+        # стартовое сообщение
+        self._push(ChatMessage(
+            role="system",
+            content=f"XENITH ready · {manager.agent_count} agents · vault: {manager.vault_path}",
+        ))
 
     # ── Запуск ────────────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Запускает UI. Блокирует вызывающий поток до команды exit."""
         self._running = True
-
-        input_thread = threading.Thread(
-            target=self._input_loop, daemon=True, name="xenith-input"
-        )
-        input_thread.start()
+        threading.Thread(target=self._input_loop, daemon=True, name="xenith-input").start()
 
         with Live(
-            self._build_layout(),
+            self._render(),
             console=self.console,
-            refresh_per_second=2,
+            refresh_per_second=4,
             screen=True,
         ) as live:
             while self._running:
-                live.update(self._build_layout())
-                time.sleep(0.5)
+                live.update(self._render())
+                time.sleep(0.25)
 
-    # ── Построение интерфейса ─────────────────────────────────────────────────
+    # ── Рендер ────────────────────────────────────────────────────────────────
 
-    def _build_layout(self) -> Layout:
+    def _render(self) -> Layout:
         layout = Layout()
         layout.split_column(
-            Layout(name="header", size=3),
-            Layout(name="body"),
-            Layout(name="result", size=12),
-            Layout(name="footer", size=3),
-        )
-        layout["body"].split_row(
-            Layout(name="agents", ratio=1),
-            Layout(name="log",    ratio=2),
+            Layout(name="header", size=1),
+            Layout(name="chat"),
+            Layout(name="divider", size=1),
+            Layout(name="input", size=3),
         )
         layout["header"].update(self._render_header())
-        layout["agents"].update(self._render_agents())
-        layout["log"].update(self._render_log())
-        layout["result"].update(self._render_result())
-        layout["footer"].update(self._render_footer())
+        layout["chat"].update(self._render_chat())
+        layout["divider"].update(Rule(style="bright_black"))
+        layout["input"].update(self._render_input())
         return layout
 
-    def _render_header(self) -> Panel:
-        s = self.manager.status
-        info = (
-            f"[dim]Очередь:[/] [yellow]{s['queue_size']}[/]  "
-            f"[dim]Файлов в vault:[/] [cyan]{s['vault_files']}[/]  "
-            f"[dim]{time.strftime('%H:%M:%S')}[/]"
-        )
-        return Panel(
-            Text.from_markup(f"{BANNER}   {info}"),
-            box=box.DOUBLE_EDGE,
-            style="bold",
-        )
-
-    def _render_agents(self) -> Panel:
-        table = Table(box=box.SIMPLE, expand=True, show_header=True, header_style="bold dim")
-        table.add_column("Агент",   style="bold", no_wrap=True)
-        table.add_column("Модель",  style="dim",  no_wrap=True)
-        table.add_column("Статус",  no_wrap=True)
-        table.add_column("Done",    justify="right", style="dim")
-
+    def _render_header(self) -> Text:
+        t = Text()
+        t.append(" ◆ XENITH ", style="bold cyan")
+        t.append("  ", style="")
         for ag in self.manager.agents:
             s = ag.stats
-            color = STATUS_COLOR.get(s["status"], "white")
-            icon  = STATUS_ICON.get(s["status"], "?")
-            model_short = s["model"].split("/")[-1][:16]
-            task_hint = f" [dim]{s['current_task']}[/]" if s["current_task"] else ""
-            status_cell = Text.from_markup(f"[{color}]{icon} {s['status']}[/]{task_hint}")
-            table.add_row(s["id"], model_short, status_cell, str(s["completed"]))
+            icon, color = STATUS_ICON.get(s["status"], ("?", "white"))
+            ag_color = self._agent_colors.get(ag.id, "white")
+            model_short = s["model"].split("/")[-1][:18]
+            t.append(f"{ag.id} ", style=f"bold {ag_color}")
+            t.append(f"{icon} {s['status']}", style=color)
+            if s["current_task"]:
+                t.append(f" [{s['current_task']}]", style="dim")
+            t.append("  ·  ", style="bright_black")
+        # убираем последний разделитель
+        q = self.manager.status["queue_size"]
+        if q:
+            t.append(f"queue: {q}", style="yellow")
+        return t
 
-        return Panel(table, title="[bold]Агенты[/]", border_style="blue")
-
-    def _render_log(self) -> Panel:
+    def _render_chat(self) -> Panel:
         with self._lock:
-            lines = list(self._log)[-22:]
-        text = Text()
-        for line in lines:
-            text.append(f"{line}\n", style="dim")
-        return Panel(text, title="[bold]Лог[/]", border_style="green")
+            msgs = list(self._messages)
 
-    def _render_result(self) -> Panel:
-        with self._lock:
-            content = self._last_result
-            rid = self._last_result_id
-        title = "[bold]Последний результат[/]" + (f" [dim]({rid})[/]" if rid else "")
-        lines = content.splitlines()[-self.MAX_RESULT_LINES:]
-        body = "\n".join(lines) if lines else "[dim]Нет результатов[/]"
-        return Panel(body, title=title, border_style="magenta")
+        # сколько строк помещается в панели (грубая оценка)
+        height = self.console.size.height - 6
+        lines: list[Text] = []
 
-    def _render_footer(self) -> Panel:
+        for msg in msgs:
+            lines.append(Text(""))   # пустая строка-разделитель
+
+            if msg.role == "system":
+                lines.append(Text(f"  {msg.content}", style="dim italic"))
+                continue
+
+            if msg.role == "you":
+                # заголовок
+                hdr = Text()
+                hdr.append("  you", style="bold bright_white")
+                hdr.append(f"  {msg.ts}", style="dim")
+                lines.append(hdr)
+                for ln in msg.content.splitlines():
+                    lines.append(Text(f"  ┃ {ln}", style="bright_white"))
+            else:
+                # агент
+                ag_color = self._agent_colors.get(msg.role, "cyan")
+                hdr = Text()
+                hdr.append(f"  {msg.role}", style=f"bold {ag_color}")
+                if msg.model:
+                    hdr.append(f"  ·  {msg.model.split('/')[-1]}", style="dim")
+                hdr.append(f"  {msg.ts}", style="dim")
+                lines.append(hdr)
+                for ln in msg.content.splitlines():
+                    lines.append(Text(f"  ┃ {ln}", style=ag_color))
+
+        # показываем только то, что влезает снизу
+        visible = lines[-height:] if len(lines) > height else lines
+        body = Text("\n").join(visible)
+
         return Panel(
-            "[bold cyan]>[/] Введи задачу и нажми Enter  "
-            "[dim]| exit — выход  | status — статус  | vault <файл> — показать файл[/]",
-            style="dim",
+            body,
+            border_style="bright_black",
             box=box.SIMPLE,
+            padding=(0, 0),
         )
 
-    # ── Ввод команд ───────────────────────────────────────────────────────────
+    def _render_input(self) -> Panel:
+        cursor = "█" if int(time.time() * 2) % 2 == 0 else " "
+        t = Text()
+        t.append("  ❯ ", style="bold cyan")
+        t.append(self._input_line, style="bright_white")
+        t.append(cursor, style="bold cyan")
+        return Panel(t, border_style="bright_black", box=box.SIMPLE, padding=(0, 0))
+
+    # ── Ввод ──────────────────────────────────────────────────────────────────
 
     def _input_loop(self) -> None:
-        """
-        Работает в отдельном потоке.
-        Live захватывает alternate screen, поэтому читаем stdin напрямую.
-        """
         while self._running:
             try:
                 line = sys.stdin.readline()
-                if line == "":          # EOF
-                    self._handle_command("exit")
+                if line == "":
+                    self._handle("exit")
                     break
                 line = line.strip()
             except (KeyboardInterrupt, EOFError):
-                self._handle_command("exit")
+                self._handle("exit")
                 break
             if line:
-                self._handle_command(line)
+                with self._lock:
+                    self._input_line = ""
+                self._handle(line)
 
-    def _handle_command(self, cmd: str) -> None:
+    def _handle(self, cmd: str) -> None:
         low = cmd.lower().strip()
 
         if low in ("exit", "quit", "q"):
-            self._push_log("Завершение по команде пользователя")
+            self._push(ChatMessage(role="system", content="Shutting down..."))
             self._running = False
             self.manager.stop()
             return
@@ -204,37 +225,48 @@ class XenithUI:
         if low == "status":
             s = self.manager.status
             working = sum(1 for a in s["agents"] if a["status"] == "working")
-            self._push_log(f"Агентов: {len(s['agents'])}, работают: {working}, очередь: {s['queue_size']}")
+            self._push(ChatMessage(
+                role="system",
+                content=f"agents: {len(s['agents'])}  working: {working}  queue: {s['queue_size']}  vault files: {s['vault_files']}",
+            ))
             return
 
         if low == "help":
-            self._push_log("Команды: exit | status | vault <путь> | <任意задача>")
+            self._push(ChatMessage(
+                role="system",
+                content="commands: exit · status · vault <path> · or just type a task",
+            ))
             return
 
         if low.startswith("vault "):
             fname = cmd[6:].strip()
             content = self.manager.memory.read(fname)
             if content:
-                with self._lock:
-                    self._last_result = content
-                    self._last_result_id = fname
+                self._push(ChatMessage(role="system", content=f"── {fname} ──\n{content[:1000]}"))
             else:
-                self._push_log(f"Файл не найден: {fname}")
+                self._push(ChatMessage(role="system", content=f"file not found: {fname}"))
             return
 
+        # задача для агентов
+        self._push(ChatMessage(role="you", content=cmd))
         task_id = self.manager.submit_task(cmd)
-        self._push_log(f"[cyan]Задача отправлена:[/] {task_id}")
 
     # ── Колбэки ───────────────────────────────────────────────────────────────
 
-    def _push_log(self, msg: str) -> None:
-        ts = time.strftime("%H:%M:%S")
-        with self._lock:
-            self._log.append(f"[{ts}] {msg}")
+    def _on_log(self, msg: str) -> None:
+        # системные логи — тихо, не мусорим чат
+        pass
 
-    def _push_result(self, result: "TaskResult") -> None:
+    def _on_result(self, result: "TaskResult") -> None:
+        # первый агент из строки "agent-1, agent-2"
+        agent_id = result.agent_id.split(",")[0].strip()
+        model = ""
+        for ag in self.manager.agents:
+            if ag.id == agent_id:
+                model = ag.model
+                break
+        self._push(ChatMessage(role=agent_id, content=result.result, model=model))
+
+    def _push(self, msg: ChatMessage) -> None:
         with self._lock:
-            self._last_result = result.result[:4000]
-            self._last_result_id = result.task_id
-        elapsed = f"{result.elapsed:.1f}с" if result.elapsed else ""
-        self._push_log(f"[green]Готово[/] {result.task_id} ({result.agent_id}{', ' + elapsed if elapsed else ''})")
+            self._messages.append(msg)
